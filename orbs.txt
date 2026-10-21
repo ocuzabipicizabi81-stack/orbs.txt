@@ -1,0 +1,683 @@
+(function() {
+    'use strict';
+
+    console.log("%c[Discord Quest Assistant] Başlatılıyor...", "color: #7c3aed; font-size: 14px; font-weight: bold;");
+
+    // 0. TEMİZLİK
+    const existingUI = document.getElementById("discord-quest-ui-root");
+    const existingStyle = document.getElementById("discord-quest-ui-styles");
+    const existingWidget = document.getElementById("discord-quest-mini-widget");
+    if (existingUI) existingUI.remove();
+    if (existingStyle) existingStyle.remove();
+    if (existingWidget) existingWidget.remove();
+    if (window.dquLiveInterval) {
+        clearInterval(window.dquLiveInterval);
+        window.dquLiveInterval = null;
+    }
+
+    // 1. WEBPACK BEKLEYİCİ VE MODÜL BULUCU (EKLENTİ KODU İLE BİREBİR)
+    function waitForWebpack(callback) {
+        const checkInterval = 100;
+        const maxAttempts = 100;
+        let attempts = 0;
+
+        const check = () => {
+            if (attempts >= maxAttempts) {
+                console.error("[Discord Quest Assistant] Webpack zaman aşımına uğradı.");
+                alert("Discord modülleri yüklenemedi. Lütfen sayfayı yenileyin.");
+                return;
+            }
+
+            if (typeof window.webpackChunkdiscord_app === 'undefined') {
+                attempts++;
+                setTimeout(check, checkInterval);
+                return;
+            }
+
+            try {
+                const originalJQuery = window.$;
+                delete window.$;
+
+                const webpackRequire = window.webpackChunkdiscord_app.push([[Symbol()], {}, (require) => require]);
+                window.webpackChunkdiscord_app.pop();
+
+                if (originalJQuery) window.$ = originalJQuery;
+
+                if (!webpackRequire || !webpackRequire.c || Object.keys(webpackRequire.c).length < 10) {
+                    attempts++;
+                    setTimeout(check, checkInterval);
+                    return;
+                }
+
+                callback(webpackRequire);
+            } catch (error) {
+                attempts++;
+                setTimeout(check, checkInterval);
+            }
+        };
+
+        check();
+    }
+
+    function findModule(webpackRequire, filter) {
+        if (!webpackRequire || !webpackRequire.c) return null;
+        for (const module of Object.values(webpackRequire.c)) {
+            if (module?.exports) {
+                const exports = module.exports;
+                if (exports.A && filter(exports.A)) return exports.A;
+                if (exports.Ay && filter(exports.Ay)) return exports.Ay;
+                if (exports.ZP && filter(exports.ZP)) return exports.ZP;
+                if (filter(exports)) return exports;
+            }
+        }
+        return null;
+    }
+
+    function loadStores(webpackRequire) {
+        try {
+            const QuestsStore = findModule(webpackRequire, m => m.__proto__?.getQuest);
+            const ChannelStore = findModule(webpackRequire, m => m.__proto__?.getAllThreadsForParent);
+            const GuildChannelStore = findModule(webpackRequire, m => m.getSFWDefaultChannel);
+            const api = findModule(webpackRequire, m => m.Bo?.get || m.tn?.get);
+
+            if (!QuestsStore || !api) return null;
+
+            return { QuestsStore, ChannelStore, GuildChannelStore, api: api.Bo || api.tn || api };
+        } catch (error) {
+            return null;
+        }
+    }
+
+    // 2. GÖREV FİLTRELEME (VİDEO + MOBİL + MASAÜSTÜ TÜM DESTEKLENEN GÖREVLER)
+    const supportedTasks = [
+        "WATCH_VIDEO",
+        "WATCH_VIDEO_ON_MOBILE",
+        "WATCH_VIDEO_ON_DESKTOP",
+        "PLAY_ON_DESKTOP",
+        "STREAM_ON_DESKTOP",
+        "STREAM_ON_MOBILE",
+        "PLAY_ACTIVITY"
+    ];
+
+    function getActiveQuests(QuestsStore) {
+        if (!QuestsStore || !QuestsStore.quests) return [];
+
+        return [...QuestsStore.quests.values()].filter(quest => {
+            const isExpired = new Date(quest.config.expiresAt).getTime() <= Date.now();
+            const isCompleted = !!quest.userStatus?.completedAt;
+            const isEnrolled = !!quest.userStatus?.enrolledAt;
+            const taskConfig = quest.config.taskConfig ?? quest.config.taskConfigV2;
+            if (!taskConfig || !taskConfig.tasks) return false;
+            const hasSupportedTask = supportedTasks.some(type => taskConfig.tasks[type] !== null && taskConfig.tasks[type] !== undefined);
+
+            return isEnrolled && !isCompleted && !isExpired && hasSupportedTask;
+        });
+    }
+
+    function initializeQuestState(quest) {
+        const taskConfig = quest.config.taskConfig ?? quest.config.taskConfigV2;
+        const taskType = supportedTasks.find(type => taskConfig.tasks[type] != null);
+
+        const taskData = taskConfig.tasks[taskType];
+        const secondsNeeded = taskData?.target ?? 0;
+        const currentProgress = quest.userStatus?.progress?.[taskType]?.value ?? quest.userStatus?.streamProgressSeconds ?? 0;
+
+        return {
+            quest,
+            taskType: taskType || "GÖREV",
+            secondsNeeded,
+            currentProgress,
+            completed: currentProgress >= secondsNeeded,
+            enrolledAt: new Date(quest.userStatus.enrolledAt).getTime(),
+            questName: quest.config.messages?.questName ?? quest.config.application?.name ?? "Discord Görevi"
+        };
+    }
+
+    // STATE VE AYARLAR
+    let userSettings = { executionMode: "sequential", autoClaimOrbs: true };
+    let isRunning = false;
+    let currentStores = null;
+    let currentQuestStates = [];
+
+    // 3. STİLLER VE ARAYÜZ OLUŞTURMA
+    function injectUI() {
+        const style = document.createElement('style');
+        style.id = "discord-quest-ui-styles";
+        style.innerHTML = `
+            @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap');
+
+            #discord-quest-ui-root {
+                position: fixed; bottom: 20px; right: 20px; width: 465px; max-height: 92vh;
+                background: rgba(13, 15, 23, 0.95); backdrop-filter: blur(28px); -webkit-backdrop-filter: blur(28px);
+                border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 24px;
+                box-shadow: 0 25px 65px rgba(0, 0, 0, 0.85), 0 0 50px rgba(124, 58, 237, 0.25);
+                color: #f2f3f5; font-family: 'Plus Jakarta Sans', sans-serif;
+                z-index: 999999; display: flex; flex-direction: column; overflow: hidden;
+                animation: dquPopIn 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            }
+
+            @keyframes dquPopIn { from { opacity: 0; transform: translateY(40px) scale(0.92); } to { opacity: 1; transform: translateY(0) scale(1); } }
+
+            #discord-quest-mini-widget {
+                position: fixed; bottom: 20px; right: 20px; z-index: 999998;
+                background: rgba(15, 17, 26, 0.92); backdrop-filter: blur(16px);
+                border: 1px solid rgba(139, 92, 246, 0.5); border-radius: 30px;
+                padding: 10px 18px; color: #fff; font-family: 'Plus Jakarta Sans', sans-serif;
+                font-size: 13px; font-weight: 800; cursor: pointer; display: none;
+                align-items: center; gap: 8px; box-shadow: 0 10px 30px rgba(0,0,0,0.5), 0 0 20px rgba(139, 92, 246, 0.4);
+                transition: all 0.25s ease;
+            }
+            #discord-quest-mini-widget:hover { transform: translateY(-3px) scale(1.03); }
+
+            .dqu-header {
+                background: linear-gradient(135deg, rgba(88, 101, 242, 0.5) 0%, rgba(139, 92, 246, 0.3) 100%);
+                padding: 16px 20px; display: flex; align-items: center; justify-content: space-between;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+            }
+
+            .dqu-title-box { display: flex; align-items: center; gap: 12px; }
+            .dqu-status-dot { width: 10px; height: 10px; border-radius: 50%; background: #23a55a; box-shadow: 0 0 12px #23a55a; animation: dquPulse 1.8s infinite; }
+            .dqu-status-dot.stopped { background: #f23f43; box-shadow: 0 0 12px #f23f43; animation: none; }
+            @keyframes dquPulse { 0% { transform: scale(0.9); box-shadow: 0 0 0 0 rgba(35, 165, 90, 0.8); } 70% { transform: scale(1.1); box-shadow: 0 0 0 10px rgba(35, 165, 90, 0); } 100% { transform: scale(0.9); box-shadow: 0 0 0 0 rgba(35, 165, 90, 0); } }
+            .dqu-title { font-weight: 800; font-size: 16.5px; letter-spacing: -0.4px; background: linear-gradient(90deg, #ffffff, #c7d2fe); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+
+            .dqu-close-btn {
+                background: rgba(255, 255, 255, 0.06); border: 1px solid rgba(255, 255, 255, 0.12);
+                color: #b5bac1; width: 30px; height: 30px; border-radius: 10px;
+                display: flex; align-items: center; justify-content: center; cursor: pointer; transition: all 0.2s ease;
+            }
+            .dqu-close-btn:hover { background: rgba(237, 66, 69, 0.3); color: #fff; transform: rotate(90deg); }
+
+            .dqu-settings-box {
+                background: rgba(0, 0, 0, 0.35); border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+                padding: 12px 18px; display: flex; flex-direction: column; gap: 10px; font-size: 11.5px;
+            }
+            .dqu-setting-row { display: flex; justify-content: space-between; align-items: center; }
+            .dqu-setting-label { font-weight: 700; color: #c7d2fe; display: flex; align-items: center; gap: 6px; }
+
+            .dqu-summary-bar {
+                background: rgba(139, 92, 246, 0.14); border: 1px solid rgba(139, 92, 246, 0.35);
+                border-radius: 12px; padding: 8px 12px; display: flex; justify-content: space-between;
+                font-size: 11.5px; font-weight: 700; color: #e0e7ff; margin-bottom: 2px;
+            }
+
+            .dqu-select-btn-group { display: flex; gap: 5px; }
+            .dqu-opt-btn {
+                background: rgba(255, 255, 255, 0.06); border: 1px solid rgba(255, 255, 255, 0.1);
+                color: #949ba4; padding: 5px 9px; border-radius: 8px; font-weight: 700; font-size: 11px;
+                cursor: pointer; transition: all 0.2s ease;
+            }
+            .dqu-opt-btn.active {
+                background: rgba(139, 92, 246, 0.35); color: #fff; border-color: rgba(139, 92, 246, 0.7);
+                box-shadow: 0 0 12px rgba(139, 92, 246, 0.3);
+            }
+            .dqu-opt-btn.danger.active { background: rgba(237, 66, 69, 0.35); color: #fff; border-color: rgba(237, 66, 69, 0.7); }
+
+            .dqu-risk-warning {
+                background: rgba(237, 66, 69, 0.15); border: 1px solid rgba(237, 66, 69, 0.4);
+                color: #ff7b7b; padding: 6px 10px; border-radius: 8px; font-size: 10.5px; font-weight: 700;
+                display: none; align-items: center; gap: 6px; margin-top: 4px;
+            }
+
+            .dqu-body { padding: 14px 18px; flex: 1; display: flex; flex-direction: column; gap: 12px; overflow: hidden; }
+
+            #dqu-quests-container {
+                max-height: 200px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px;
+                padding-right: 4px; scroll-behavior: smooth;
+            }
+            #dqu-quests-container::-webkit-scrollbar { width: 6px; }
+            #dqu-quests-container::-webkit-scrollbar-track { background: rgba(0, 0, 0, 0.2); border-radius: 10px; }
+            #dqu-quests-container::-webkit-scrollbar-thumb { background: rgba(139, 92, 246, 0.4); border-radius: 10px; }
+
+            .dqu-quest-card {
+                background: rgba(255, 255, 255, 0.035); border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 16px; padding: 14px; transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+                animation: dquCardSlideIn 0.4s ease forwards;
+            }
+            @keyframes dquCardSlideIn { from { opacity: 0; transform: translateY(15px); } to { opacity: 1; transform: translateY(0); } }
+
+            .dqu-quest-card.active { border-color: rgba(139, 92, 246, 0.7); background: rgba(139, 92, 246, 0.09); box-shadow: 0 0 20px rgba(139, 92, 246, 0.25); }
+            .dqu-quest-card.completed { border-color: rgba(35, 165, 90, 0.5); background: rgba(35, 165, 90, 0.06); }
+
+            .dqu-card-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 4px; }
+            .dqu-quest-title { font-weight: 800; font-size: 14px; color: #fff; }
+
+            .dqu-status-badge { font-size: 10px; font-weight: 800; padding: 3px 8px; border-radius: 6px; text-transform: uppercase; }
+            .badge-pending { background: rgba(255, 255, 255, 0.08); color: #949ba4; }
+            .badge-active { background: rgba(139, 92, 246, 0.3); color: #c7d2fe; border: 1px solid rgba(139, 92, 246, 0.5); }
+            .badge-completed { background: rgba(35, 165, 90, 0.25); color: #34d399; }
+
+            .dqu-quest-type { font-size: 11px; color: #949ba4; text-transform: uppercase; font-weight: 700; margin-bottom: 10px; display: flex; justify-content: space-between; }
+            .dqu-progress-bg { height: 9px; background: rgba(0, 0, 0, 0.4); border-radius: 10px; overflow: hidden; position: relative; }
+            .dqu-progress-bar { height: 100%; width: 0%; background: linear-gradient(90deg, #5865f2 0%, #a855f7 50%, #ec4899 100%); border-radius: 10px; transition: width 0.4s ease; }
+
+            .dqu-progress-info { font-size: 11.5px; color: #dbdee1; margin-top: 6px; display: flex; justify-content: space-between; font-weight: 700; }
+            .dqu-live-eta { color: #f43f5e; font-weight: 800; }
+
+            .dqu-terminal {
+                background: rgba(0, 0, 0, 0.6); border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 14px; padding: 10px 12px; font-family: 'Consolas', monospace; font-size: 11px;
+                height: 95px; overflow-y: auto; color: #3ba55c; display: flex; flex-direction: column; gap: 4px;
+            }
+            .dqu-log-line { word-break: break-all; line-height: 1.4; }
+            .dqu-log-info { color: #818cf8; } .dqu-log-success { color: #34d399; }
+            .dqu-log-warn { color: #fbbf24; } .dqu-log-err { color: #f87171; }
+
+            .dqu-credits { text-align: center; font-size: 11px; color: #949ba4; margin-top: 1px; font-weight: 600; }
+            .dqu-credits strong { color: #a5b4fc; }
+
+            .dqu-socials { display: flex; gap: 10px; }
+            .dqu-social-btn { flex: 1; padding: 8px 10px; border-radius: 10px; text-decoration: none; font-size: 11.5px; font-weight: 700; display: flex; align-items: center; justify-content: center; gap: 6px; transition: all 0.2s ease; border: 1px solid rgba(255, 255, 255, 0.1); }
+            .dqu-yt { background: rgba(255, 0, 0, 0.15); color: #ff4d4d; border-color: rgba(255, 0, 0, 0.3); }
+            .dqu-yt:hover { background: rgba(255, 0, 0, 0.35); color: #fff; }
+            .dqu-dc { background: rgba(88, 101, 242, 0.2); color: #818cf8; border-color: rgba(88, 101, 242, 0.4); }
+            .dqu-dc:hover { background: rgba(88, 101, 242, 0.4); color: #fff; }
+
+            .dqu-actions { display: flex; gap: 10px; }
+            .dqu-btn { flex: 1; padding: 11px 16px; border-radius: 12px; border: none; font-weight: 800; font-size: 13.5px; cursor: pointer; transition: all 0.2s ease; display: flex; align-items: center; justify-content: center; }
+            .dqu-btn-primary { background: linear-gradient(135deg, #5865f2 0%, #7c3aed 100%); color: #fff; box-shadow: 0 4px 18px rgba(88, 101, 242, 0.4); }
+            .dqu-btn-primary:hover { transform: translateY(-1.5px); box-shadow: 0 6px 22px rgba(88, 101, 242, 0.6); }
+            .dqu-btn-stop { background: linear-gradient(135deg, #ed4245 0%, #c0392b 100%); color: #fff; box-shadow: 0 4px 18px rgba(237, 66, 69, 0.4); }
+            .dqu-btn-stop:hover { transform: translateY(-1.5px); box-shadow: 0 6px 22px rgba(237, 66, 69, 0.6); }
+        `;
+        document.head.appendChild(style);
+
+        const miniWidget = document.createElement('div');
+        miniWidget.id = "discord-quest-mini-widget";
+        miniWidget.innerHTML = `<span>⚡ Quest Assistant (Aç)</span>`;
+        document.body.appendChild(miniWidget);
+
+        const uiContainer = document.createElement('div');
+        uiContainer.id = "discord-quest-ui-root";
+        uiContainer.innerHTML = `
+            <div class="dqu-header">
+                <div class="dqu-title-box">
+                    <div class="dqu-status-dot" id="dqu-dot"></div>
+                    <div class="dqu-title">Discord Quest Assistant</div>
+                </div>
+                <button class="dqu-close-btn" id="dqu-close-x" title="Küçült">✕</button>
+            </div>
+            <div class="dqu-settings-box">
+                <div class="dqu-summary-bar">
+                    <span id="dqu-total-time">⏱️ Toplam Tahmini Süre: Hesaplanıyor...</span>
+                    <span id="dqu-total-count">📊 Görevler: 0</span>
+                </div>
+                <div class="dqu-setting-row">
+                    <div class="dqu-setting-label">🔮 Ödül / Orbs Topla:</div>
+                    <div class="dqu-select-btn-group">
+                        <button class="dqu-opt-btn active" id="opt-orb-on">Açık</button>
+                        <button class="dqu-opt-btn" id="opt-orb-off">Kapalı</button>
+                    </div>
+                </div>
+                <div class="dqu-setting-row">
+                    <div class="dqu-setting-label">🔀 İşlem Modu:</div>
+                    <div class="dqu-select-btn-group">
+                        <button class="dqu-opt-btn active" id="opt-mode-seq">🔴 Sırayla (Güvenli)</button>
+                        <button class="dqu-opt-btn danger" id="opt-mode-para">⚡ Aynı Anda (Hızlı)</button>
+                    </div>
+                </div>
+                <div class="dqu-risk-warning" id="dqu-risk-banner">
+                    ⚠️ UYARI: Aynı anda birden fazla görev yapmak yüksek risk taşır (Hesap kısıtlanabilir).
+                </div>
+            </div>
+            <div class="dqu-body">
+                <div id="dqu-quests-container">
+                    <div style="text-align:center; padding: 20px; color: #949ba4; font-size:13px;">Görevler taranıyor...</div>
+                </div>
+                <div class="dqu-terminal" id="dqu-terminal">
+                    <div class="dqu-log-line dqu-log-info">[Sistem] Arayüz hazır. Modüller bağlandı.</div>
+                </div>
+                <div class="dqu-credits">
+                    Yapımcı: <strong>kaptanbey0</strong> (Cahit için yapılmıştır ❤️)
+                </div>
+                <div class="dqu-socials">
+                    <a href="https://www.youtube.com/@cahitgergin" target="_blank" class="dqu-social-btn dqu-yt">▶ YouTube (Cahit Gergin)</a>
+                    <a href="https://discord.gg/WDrUSHr" target="_blank" class="dqu-social-btn dqu-dc">💬 Discord Sunucusu</a>
+                </div>
+                <div class="dqu-actions">
+                    <button class="dqu-btn dqu-btn-primary" id="dqu-start-btn">⚡ Görevleri Otomatik Başlat</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(uiContainer);
+
+        document.getElementById("dqu-close-x").onclick = () => {
+            uiContainer.style.display = "none";
+            miniWidget.style.display = "flex";
+        };
+
+        miniWidget.onclick = () => {
+            uiContainer.style.display = "flex";
+            miniWidget.style.display = "none";
+        };
+
+        const setupOptionBtn = (btnId, groupIds, onClick) => {
+            const btn = document.getElementById(btnId);
+            btn.onclick = () => {
+                groupIds.forEach(id => document.getElementById(id).classList.remove("active"));
+                btn.classList.add("active");
+                onClick();
+            };
+        };
+
+        setupOptionBtn("opt-orb-on", ["opt-orb-on", "opt-orb-off"], () => { userSettings.autoClaimOrbs = true; log("Ödül/Orbs Toplama: Açık", "info"); });
+        setupOptionBtn("opt-orb-off", ["opt-orb-on", "opt-orb-off"], () => { userSettings.autoClaimOrbs = false; log("Ödül/Orbs Toplama: Kapalı", "info"); });
+
+        const modeGroup = ["opt-mode-seq", "opt-mode-para"];
+        const riskBanner = document.getElementById("dqu-risk-banner");
+
+        setupOptionBtn("opt-mode-seq", modeGroup, () => {
+            userSettings.executionMode = "sequential";
+            riskBanner.style.display = "none";
+            log("İşlem Modu: Sırayla (Tek Tek / Güvenli)", "info");
+        });
+
+        setupOptionBtn("opt-mode-para", modeGroup, () => {
+            userSettings.executionMode = "parallel";
+            riskBanner.style.display = "flex";
+            log("⚠️ UYARI: Aynı Anda Modu Seçildi! Yüksek risk taşır.", "err");
+        });
+    }
+
+    const log = (msg, type = "info") => {
+        const terminal = document.getElementById("dqu-terminal");
+        if (!terminal) return;
+        const line = document.createElement("div");
+        line.className = `dqu-log-line dqu-log-${type}`;
+        const time = new Date().toLocaleTimeString('tr-TR', { hour12: false });
+        line.innerText = `[${time}] ${msg}`;
+        terminal.appendChild(line);
+        terminal.scrollTop = terminal.scrollHeight;
+    };
+
+    // HER SANİYE CANLI GERÇEK ZAMANLI SÜRE GÜNCELLEYİCİ
+    const calculateTotalTime = (questStates) => {
+        let totalSeconds = 0;
+        let uncompletedCount = 0;
+
+        questStates.forEach(state => {
+            if (!state.completed) {
+                const rem = Math.max(0, state.secondsNeeded - state.currentProgress);
+                totalSeconds += rem;
+                uncompletedCount++;
+            }
+        });
+
+        const timeElem = document.getElementById("dqu-total-time");
+        const countElem = document.getElementById("dqu-total-count");
+
+        if (countElem) countElem.innerText = `📊 Aktif: ${uncompletedCount} / ${questStates.length}`;
+
+        if (timeElem) {
+            if (totalSeconds <= 0) {
+                timeElem.innerText = "⏱️ Toplam Süre: Tamamlandı 🎉";
+            } else {
+                const mins = Math.floor(totalSeconds / 60);
+                const secs = Math.floor(totalSeconds % 60);
+                timeElem.innerText = `⏱️ Toplam Tahmini Süre: ${mins} dk ${secs} sn`;
+            }
+        }
+    };
+
+    const updateCardProgress = (questId, currentSec, totalSec, isCompleted = false, etaText = "") => {
+        const card = document.getElementById(`dqu-card-${questId}`);
+        const bar = document.getElementById(`dqu-bar-${questId}`);
+        const text = document.getElementById(`dqu-text-${questId}`);
+        const pctElem = document.getElementById(`dqu-pct-${questId}`);
+        const badge = document.getElementById(`dqu-badge-${questId}`);
+        const etaElem = document.getElementById(`dqu-eta-${questId}`);
+
+        const pct = Math.min(100, Math.floor((currentSec / totalSec) * 100));
+
+        if (bar) bar.style.width = `${pct}%`;
+        if (text) text.innerText = `${Math.floor(currentSec)}s / ${totalSec}s`;
+        if (pctElem) pctElem.innerText = `${pct}%`;
+        if (etaElem) etaElem.innerText = etaText;
+
+        if (card) {
+            if (isCompleted) {
+                card.className = "dqu-quest-card completed";
+                if (badge) { badge.className = "dqu-status-badge badge-completed"; badge.innerText = "✓ Tamamlandı"; }
+            } else {
+                card.className = "dqu-quest-card active";
+                if (badge) { badge.className = "dqu-status-badge badge-active"; badge.innerText = "▶ İşleniyor"; }
+            }
+        }
+    };
+
+    const renderQuests = () => {
+        const container = document.getElementById("dqu-quests-container");
+        if (!container || !currentStores) return;
+        const activeQuests = getActiveQuests(currentStores.QuestsStore);
+        if (activeQuests.length === 0) {
+            container.innerHTML = `<div style="text-align:center; padding: 20px; color: #34d399; font-weight:800; font-size:13px;">🎉 Tamamlanacak kabul edilmiş aktif görev bulunamadı!</div>`;
+            log("Hesapta yapılabilir kabul edilmiş aktif görev bulunamadı.", "success");
+            const timeElem = document.getElementById("dqu-total-time");
+            const countElem = document.getElementById("dqu-total-count");
+            if (timeElem) timeElem.innerText = "⏱️ Toplam Tahmini Süre: 0 dk";
+            if (countElem) countElem.innerText = "📊 Görevler: 0";
+            return;
+        }
+        container.innerHTML = "";
+        currentQuestStates = activeQuests.map(quest => initializeQuestState(quest));
+        calculateTotalTime(currentQuestStates);
+
+        currentQuestStates.forEach(state => {
+            const { quest } = state;
+            const pct = Math.min(100, Math.floor((state.currentProgress / state.secondsNeeded) * 100));
+
+            const card = document.createElement("div");
+            card.className = "dqu-quest-card";
+            card.id = `dqu-card-${quest.id}`;
+            card.innerHTML = `
+                <div class="dqu-card-header">
+                    <div class="dqu-quest-title">${state.questName}</div>
+                    <div class="dqu-card-actions">
+                        <div class="dqu-status-badge badge-pending" id="dqu-badge-${quest.id}">${state.completed ? 'Tamamlandı' : 'Bekliyor'}</div>
+                    </div>
+                </div>
+                <div class="dqu-quest-type">
+                    <span>📌 Tür: ${state.taskType}</span>
+                    <span id="dqu-eta-${quest.id}" class="dqu-live-eta"></span>
+                </div>
+                <div class="dqu-progress-bg">
+                    <div class="dqu-progress-bar" id="dqu-bar-${quest.id}" style="width: ${pct}%"></div>
+                </div>
+                <div class="dqu-progress-info">
+                    <span id="dqu-text-${quest.id}">${Math.floor(state.currentProgress)}s / ${state.secondsNeeded}s</span>
+                    <span id="dqu-pct-${quest.id}">${pct}%</span>
+                </div>
+            `;
+            container.appendChild(card);
+        });
+        log(`${activeQuests.length} adet kabul edilmiş yapılabilir görev tespit edildi.`, "info");
+    };
+
+    // SANİYE SANİYE CANLI EKRAN İLERLEMESİ GÜNCELLEYİCİ
+    function startLiveTicker() {
+        if (window.dquLiveInterval) clearInterval(window.dquLiveInterval);
+        window.dquLiveInterval = setInterval(() => {
+            if (!isRunning || !currentQuestStates || currentQuestStates.length === 0) return;
+
+            currentQuestStates.forEach(state => {
+                if (!state.completed && state.currentProgress < state.secondsNeeded) {
+                    state.currentProgress = Math.min(state.secondsNeeded, state.currentProgress + 1);
+                    const rem = Math.max(0, Math.ceil(state.secondsNeeded - state.currentProgress));
+                    const isVideo = state.taskType.includes("VIDEO") || state.taskType.includes("WATCH");
+                    const etaText = isVideo ? `⏱ Kalan: ${rem}s` : `⏱ Tahmini: ${Math.ceil(rem / 60)} dk`;
+                    updateCardProgress(state.quest.id, state.currentProgress, state.secondsNeeded, false, etaText);
+                }
+            });
+
+            calculateTotalTime(currentQuestStates);
+        }, 1000);
+    }
+
+    // EKLENTİ İLE 100% UYUMLU STEP FONKSİYONLARI (VİDEO + İZLEME + MOBİL DESTEKLİ)
+    async function processVideoStep(state, api) {
+        const { quest, secondsNeeded } = state;
+        const speed = 1;
+        const nextTime = Math.min(secondsNeeded, state.currentProgress + speed + Math.random());
+
+        try {
+            const res = await api.post({ url: `/quests/${quest.id}/video-progress`, body: { timestamp: nextTime } });
+            state.currentProgress = nextTime;
+            const rem = Math.max(0, Math.ceil(secondsNeeded - state.currentProgress));
+            updateCardProgress(quest.id, state.currentProgress, secondsNeeded, false, `⏱ Kalan: ${rem}s`);
+            log(`Video İlerlemesi: ${Math.floor(state.currentProgress)} / ${secondsNeeded} sn`, "info");
+
+            if (res.body.completed_at !== null || state.currentProgress >= secondsNeeded) {
+                state.completed = true;
+                updateCardProgress(quest.id, secondsNeeded, secondsNeeded, true, "");
+                await api.post({ url: `/quests/${quest.id}/video-progress`, body: { timestamp: secondsNeeded } });
+                log(`✨ ${state.questName} Tamamlandı!`, "success");
+                if (userSettings.autoClaimOrbs) await claimQuestOrbs(quest, api);
+            }
+        } catch (error) {}
+    }
+
+    async function processHeartbeatStep(state, stores) {
+        const { api, ChannelStore, GuildChannelStore } = stores;
+        const { quest, taskType, secondsNeeded } = state;
+
+        let channelId = ChannelStore?.getSortedPrivateChannels()[0]?.id;
+        if (!channelId && GuildChannelStore) {
+            const guilds = Object.values(GuildChannelStore.getAllGuilds());
+            const voice = guilds.find(g => g?.VOCAL?.length > 0);
+            if (voice) channelId = voice.VOCAL[0].channel.id;
+        }
+
+        const streamKey = channelId ? `call:${channelId}:1` : `call:${quest.id}:1`;
+
+        try {
+            const response = await api.post({
+                url: `/quests/${quest.id}/heartbeat`,
+                body: { stream_key: streamKey, terminal: false }
+            });
+
+            const serverProgress = response.body?.progress?.[taskType]?.value ?? state.currentProgress;
+            state.currentProgress = serverProgress;
+
+            const rem = Math.max(0, Math.ceil((secondsNeeded - state.currentProgress) / 60));
+            updateCardProgress(quest.id, state.currentProgress, secondsNeeded, state.currentProgress >= secondsNeeded, `⏱ Tahmini: ${rem} dk`);
+            log(`Görev İlerlemesi: ${Math.floor(state.currentProgress)} / ${secondsNeeded} sn`, "info");
+
+            if (state.currentProgress >= secondsNeeded) {
+                await api.post({
+                    url: `/quests/${quest.id}/heartbeat`,
+                    body: { stream_key: streamKey, terminal: true }
+                });
+                state.completed = true;
+                updateCardProgress(quest.id, secondsNeeded, secondsNeeded, true, "");
+                log(`✨ ${state.questName} Tamamlandı!`, "success");
+                if (userSettings.autoClaimOrbs) await claimQuestOrbs(quest, api);
+            }
+        } catch (error) {}
+    }
+
+    async function claimQuestOrbs(quest, api) {
+        log(`🔮 Ödül / Orbs Talep Ediliyor: ${quest.config.messages?.questName ?? 'Görev'}`, "info");
+        try {
+            const res = await api.post({ url: `/quests/${quest.id}/claim`, body: { platform: 0 } });
+            if (res.body) log(`🎉 Ödül/Orbs Başarıyla Toplandı!`, "success");
+        } catch(e) {}
+    }
+
+    // ANA ÇALIŞTIRMA KONTROLCÜSÜ (Eklentideki `runQuestCode` Mantığı)
+    async function runQuestEngine(stores) {
+        const activeQuests = getActiveQuests(stores.QuestsStore);
+        if (activeQuests.length === 0) {
+            log("Tamamlanacak kabul edilmiş aktif görev bulunamadı!", "success");
+            const startBtn = document.getElementById("dqu-start-btn");
+            const statusDot = document.getElementById("dqu-dot");
+            if (startBtn) {
+                startBtn.innerText = "✓ Tüm Görevler Tamamlandı";
+                startBtn.className = "dqu-btn dqu-btn-primary dqu-btn-disabled";
+            }
+            if (statusDot) statusDot.classList.add("stopped");
+            isRunning = false;
+            return;
+        }
+
+        const questStates = activeQuests.map(quest => initializeQuestState(quest));
+        currentQuestStates = questStates;
+
+        startLiveTicker();
+
+        const runStateLoop = async (state) => {
+            while (!state.completed && isRunning) {
+                const isVideo = state.taskType.includes("VIDEO") || state.taskType.includes("WATCH");
+
+                if (isVideo) {
+                    await processVideoStep(state, stores.api);
+                    if (!state.completed && isRunning) {
+                        await new Promise(r => setTimeout(r, 1000 + (Math.random() * 500)));
+                    }
+                } else {
+                    await processHeartbeatStep(state, stores);
+                    if (!state.completed && isRunning) {
+                        await new Promise(r => setTimeout(r, 20000 + (Math.random() * 2000)));
+                    }
+                }
+            }
+        };
+
+        if (userSettings.executionMode === "parallel") {
+            log(`⚡ Eşzamanlı Mod: ${questStates.length} görev aynı anda çalıştırılıyor...`, "warn");
+            await Promise.all(questStates.map(state => runStateLoop(state)));
+        } else {
+            for (const state of questStates) {
+                if (!isRunning) break;
+                if (!state.completed) await runStateLoop(state);
+            }
+        }
+
+        if (isRunning) {
+            log("Tüm görevler başarıyla tamamlandı!", "success");
+            const startBtn = document.getElementById("dqu-start-btn");
+            const statusDot = document.getElementById("dqu-dot");
+            if (startBtn) {
+                startBtn.innerText = "✓ Tüm Görevler Tamamlandı";
+                startBtn.className = "dqu-btn dqu-btn-primary dqu-btn-disabled";
+            }
+            if (statusDot) statusDot.classList.add("stopped");
+            isRunning = false;
+        }
+    }
+
+    // WEBPACK HAZIR OLDUĞUNDA BAŞLAT
+    waitForWebpack((webpackRequire) => {
+        const stores = loadStores(webpackRequire);
+        if (!stores) {
+            alert("Discord Mağaza/API modülleri bulunamadı. Lütfen Discord'u yenileyin.");
+            return;
+        }
+
+        currentStores = stores;
+        injectUI();
+        renderQuests();
+
+        const startBtn = document.getElementById("dqu-start-btn");
+        const statusDot = document.getElementById("dqu-dot");
+
+        startBtn.onclick = () => {
+            if (isRunning) {
+                isRunning = false;
+                if (window.dquLiveInterval) { clearInterval(window.dquLiveInterval); window.dquLiveInterval = null; }
+                startBtn.innerText = "⚡ Görevleri Otomatik Başlat";
+                startBtn.className = "dqu-btn dqu-btn-primary";
+                statusDot.classList.add("stopped");
+                log("⏸️ İşlem durduruldu.", "warn");
+            } else {
+                isRunning = true;
+                startBtn.innerText = "⏸️ İşlemi Durdur";
+                startBtn.className = "dqu-btn dqu-btn-stop";
+                statusDot.classList.remove("stopped");
+                log("▶ İşlem başlatıldı.", "info");
+                runQuestEngine(stores);
+            }
+        };
+
+        console.log("%c[Discord Quest Assistant] Arayüz Ekranın Sağ Altına Başarıyla Yüklendi!", "color: #34d399; font-size: 14px; font-weight: bold;");
+    });
+})();
